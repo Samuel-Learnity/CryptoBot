@@ -1,0 +1,118 @@
+CRYPTO STOP-LOSS BOT — NOTE DE STRATÉGIE (version pédagogique)
+
+OBJET
+-----
+Ce document décrit, côté “logique de trading” (et non technique), ce que fait l’algorithme : conditions d’ENTRÉE, règles de SORTIE, gestion du risque et garde-fous. Il s’applique aux paires crypto au comptant (spot), typiquement sur Binance.
+
+UNIVERS & ÉVÉNEMENT DE MARCHÉ
+------------------------------
+• Marché : crypto SPOT (ex.: BTC/USDT, WIF/USDT, PYTH/USDT, etc.).
+• Sens : LONG uniquement (achat → revente plus haut).
+• Timeframe (cfg.timeframe) : la stratégie travaille sur des bougies (ex. 1h, 15m, 5m…).
+• Déclencheur : la logique d’entrée est évaluée à la CLÔTURE de chaque bougie (close).
+• Multi-symboles : on scanne la liste cfg.symbols, mais on ne tient qu’UNE position à la fois.
+• Filtre de microstructure : on vérifie le spread carnet (best ask / best bid).
+
+PARAMÈTRES IMPORTANTS
+---------------------
+• breakout_lookback (20 par défaut) : fenêtre pour le plus haut “HH”.
+• stop_lookback (10 par défaut)     : fenêtre pour le plus bas “LL”.
+• use_atr_stop (false) / atr_mult (2.0) : alternative ATR pour le stop.
+• risk_per_trade_pct (1.0 %) : part du capital risquée par trade.
+• max_spread_pct (0.5 %) : spread maximum autorisé pour entrer.
+• take_profit_R (1.0) : niveau de TP1 en multiples de R.
+• tp_fraction (50 %) : fraction de la position vendue à TP1.
+• trailing_use_atr (true) : trailing stop basé sur ATR (type chandelier).
+• kill_switch_daily_dd_pct (–3 %) : seuil de perte journalière max (pause ensuite).
+
+DÉFINITIONS (HH / LL / R)
+-------------------------
+• HH_N (Highest High) : plus haut des N bougies précédant la bougie courante (N = breakout_lookback).
+• LL_N (Lowest Low)   : plus bas des N bougies précédant la bougie courante (N = stop_lookback).
+• R (valeur de risque en prix) : R = entry_price – stop_price (en long).
+
+RÈGLE D’ENTRÉE (LONG)
+---------------------
+1) Breakout confirmé à la clôture : close_t > HH_N (N = breakout_lookback, ex. HH20).
+2) Filtre de spread : spread_% ≤ max_spread_pct au moment de l’entrée.
+3) Sizing valide : la taille calculée est > 0 et respecte les minima de l’exchange.
+→ Si 1–3 sont vrais : on achète au marché (en live) ou on simule l’entrée (dry_run).
+
+CALCUL DU STOP INITIAL
+----------------------
+Deux variantes :
+
+A) LL-based (par défaut)
+   stop_price = LL_N (N = stop_lookback), c.-à-d. le plus bas des N bougies précédentes (on exclut la bougie qui se clôture).
+
+B) ATR-based (si use_atr_stop = true)
+   stop_price = close_t – atr_mult × ATR(14)
+   (ATR(14) en moyenne mobile exponentielle ; atr_mult = 2.0 par défaut).
+
+DIMENSIONNEMENT (POSITION SIZING)
+---------------------------------
+• Risque en devise = equity × risk_per_trade_pct.
+• Distance de stop = |entry_price – stop_price|.
+• Notional = Risque / Distance_de_stop.
+• Quantité (qty) = Notional / entry_price, arrondie aux pas de l’exchange.
+• Contrôle des minima : si notional < min_cost imposé par le marché, on annule l’entrée.
+
+PRISE DE PROFIT PARTIELLE (TP1)
+-------------------------------
+• Niveau : TP1 = entry_price + take_profit_R × R (avec R = entry – stop).
+• Exécution : on vend tp_fraction (ex. 50 %) de la position à TP1.
+• Effet : le stop du reliquat est remonté à Break-Even (≥ entry_price).
+
+STOP TRAILING (CHANDLIER ATR SIMPLIFIÉ)
+---------------------------------------
+• Si trailing_use_atr = true :
+  – À chaque nouvelle bougie, on recalcule ATR(14).
+  – On pose un “chandelier” : trail = High_t – atr_mult × ATR.
+  – Si trail > stop_price actuel, on remonte le stop à trail (jamais vers le bas).
+• Remarque : trailing relativement serré (utilise le HIGH de la dernière bougie).
+
+RÈGLES DE SORTIE
+----------------
+• Sortie STOP : à tout moment, si last_price ≤ stop_price → on liquide TOUT le reliquat.
+• Sortie TP1  : prise partielle à TP1 (cf. ci-dessus), puis la position restante continue avec trailing-stop.
+• Pas d’autres TP : après TP1, on laisse courir jusqu’au stop trailing (ou STOP).
+
+GARDE-FOUS (RISK THROTTLES)
+---------------------------
+• Kill Switch quotidien : si PnL jour ≤ kill_switch_daily_dd_pct, le bot se met en pause jusqu’au lendemain (UTC).
+• Filtre de spread : si spread_% > max_spread_pct au moment de l’entrée, on refuse l’ordre.
+• Une position à la fois : pas de pyramiding, pas de scale-in/out autres que TP1.
+
+JOURNALISATION
+--------------
+• Chaque évènement est loggé dans trades.csv : timestamp, symbol, action, prix, quantité, PnL réalisé, equity, note.
+• En dry_run : *_SIM (ENTER_SIM, TP1_SIM, EXIT_SIM_STOP…). En live : *_LIVE.
+
+EXEMPLE CHIFFRÉ (pédagogique)
+-----------------------------
+Contexte : equity = 10 000 USDT, risk_per_trade_pct = 1 %, breakout_lookback = 20, stop_lookback = 10.
+À la clôture H : close casse HH20 ⇒ entrée.
+• entry_price = 1.0000 ; stop_price (LL10) = 0.9500 → R = 0.0500.
+• Risque en devise = 10 000 × 1 % = 100 USDT.
+• Notional = 100 / 0.0500 = 2 000 USDT ⇒ qty ≈ 2 000 unités (avant arrondi).
+• TP1 = 1.0500. À TP1, on vend 50 %, stop remonté à BE (≥ 1.0000).
+• Ensuite, trailing : si High_t – 2×ATR(14) > stop, stop relevé à ce niveau. Sortie finale quand le prix casse ce stop.
+
+LIMITES CONNUES
+---------------
+• Uniquement LONG SPOT (pas de shorts, pas de levier par défaut).
+• Un seul TP partiel (TP1) ; pas d’échelonnage multiple.
+• Pas de filtre de tendance “macro” (ex. MA200 daily), ni de filtres d’événements.
+• Pas de gestion multi-positions (une position à la fois).
+• L’ATR-trailing utilise le plus haut de la DERNIÈRE bougie (chandelier “serré”).
+• Les paramètres doivent être adaptés à la volatilité/liquidité de chaque paire/timeframe.
+
+RÉCAP’ OPÉRATIONNEL (check-list)
+--------------------------------
+1) À la clôture d’une bougie : si close > HH_N → CANDIDAT.
+2) Vérifier spread_% ≤ max_spread_pct → OK ?
+3) Calculer stop (LL_N ou ATR) et la taille (ex. 1 % de risque).
+4) Entrer (ou simuler) → TP1 = entry + R×take_profit_R.
+5) À TP1 : vendre tp_fraction ; stop → Break-Even.
+6) Tant que position ouverte : trailing stop = max(stop, High_t – atr_mult×ATR).
+7) Sortie finale : stop touché (STOP ou trailing), ou kill switch activé si la journée est trop négative.

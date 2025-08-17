@@ -1,0 +1,32 @@
+exchange: binance
+sandbox: false
+dry_run: true
+symbols: ["BTC/USDT"]
+timeframe: "1h"
+risk_per_trade_pct: 1.0
+breakout_lookback: 20
+stop_lookback: 10
+use_atr_stop: false
+atr_mult: 2.0
+max_spread_pct: 0.5
+take_profit_R: 1.0
+tp_fraction: 0.5
+trailing_use_atr: true
+kill_switch_daily_dd_pct: -3.0
+poll_seconds: 60
+journal_csv: "trades.csv"
+fiat: "USDT"
+
+use_websocket: true
+ws_reconnect_sec: 3.0
+
+verbose_signals: true
+market_data:
+  use_websocket: true
+  ws_reconnect_sec: 3.0
+terminal_chart:
+  enable: false
+  limit: 120
+
+# Alerts sonores (macOS: utilise 'afplay' si dispo; sinon cloche terminal)
+sound_alerts: true
