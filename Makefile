@@ -20,7 +20,7 @@ VIEWER       ?= plotext
 
 # Flags spécifiques
 ASCII_FLAGS   ?= --limit 200 --height 24 --cols 100
-PLOTEXT_FLAGS ?= --limit 120
+PLOTEXT_FLAGS ?= --limit 300
 
 # Overlays (plotext uniquement)
 OVERLAY     ?= 1
