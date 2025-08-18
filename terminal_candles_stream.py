@@ -4,8 +4,13 @@ Streaming Candlestick (Terminal) — Binance WebSocket + plotext (gratuit)
 - Précharge l'historique via REST Binance (affichage immédiat)
 - Bougies en temps réel via WS
 - Utilise des indices numériques en abscisse + étiquettes texte (évite les erreurs de format de dates)
-Usage:
+- (Optionnel) Mini serveur HTTP /health et /status avec port auto-incrémenté
+
+Usage (classique, sans serveur):
     python terminal_candles_stream.py --symbol BTC/USDT --timeframe 1m --limit 120
+
+Usage (avec mini serveur HTTP et port auto):
+    python terminal_candles_stream.py --symbol BTC/USDT --timeframe 1m --limit 120 --serve
 """
 import argparse
 import asyncio
@@ -16,6 +21,14 @@ from datetime import datetime, timezone
 from typing import Deque, List, Tuple
 from collections import deque
 
+# --- Ajouts pour serveur HTTP optionnel ---
+import os
+import socket
+import contextlib
+import threading
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+# ------------------------------------------
+
 import websockets
 import requests
 
@@ -24,6 +37,9 @@ try:
 except Exception as e:
     print("plotext est requis pour l'affichage en bougies. Installe-le:  pip install plotext")
     raise
+
+# Statut global exporté par /status (mis à jour au rendu)
+GLOBAL_STATUS = {}
 
 def to_stream_symbol(sym: str) -> str:
     return sym.replace("/", "").lower()
@@ -86,9 +102,64 @@ def fetch_klines_rest(symbol: str, timeframe: str, limit: int):
     r.raise_for_status()
     return r.json()
 
+# ---------- Serveur HTTP optionnel ----------
+def find_free_port_incremental(base: int = 8765, host: str = "127.0.0.1", max_tries: int = 200) -> int:
+    """Retourne le premier port libre en testant base, base+1, ..."""
+    p = base
+    for _ in range(max_tries):
+        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((host, p))
+                return p
+            except OSError:
+                p += 1
+    raise RuntimeError("Aucun port libre trouvé dans la plage testée.")
+
+def start_status_server(host: str, port: int):
+    """Démarre un mini serveur HTTP en thread daemon. Expose /health et /status."""
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # silence le bruit
+            return
+        def do_GET(self):
+            if self.path.startswith("/health"):
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.startswith("/status"):
+                payload = dict(GLOBAL_STATUS) if GLOBAL_STATUS else {"status": "warming_up"}
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404); self.end_headers()
+
+    srv = ThreadingHTTPServer((host, port), Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv, t
+# --------------------------------------------
+
 async def stream(symbol: str, timeframe: str, limit: int, ma_period:int=20, breakout:int=20, overlay_ma20:bool=False, overlay_hh20:bool=False, lookback:int=20):
     url = f"wss://stream.binance.com:9443/ws/{to_stream_symbol(symbol)}@kline_{timeframe}"
     buf = CandleBuffer(limit=limit)
+
+    # Init status global
+    GLOBAL_STATUS.update({
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "points": 0,
+        "last": None,
+        "ma_period": ma_period,
+        "breakout": breakout,
+    })
 
     # Précharge l'historique pour rendu immédiat
     try:
@@ -144,6 +215,17 @@ async def stream(symbol: str, timeframe: str, limit: int, ma_period:int=20, brea
             plx.xticks(xticks, xlabels)
         except Exception:
             pass
+        # MAJ statut global
+        try:
+            last_close = c[-1] if c else None
+            GLOBAL_STATUS.update({
+                "points": len(c),
+                "last": last_close,
+                "label_last": lbl[-1] if lbl else None,
+            })
+        except Exception:
+            pass
+
         plx.show()
 
     # Premier rendu
@@ -184,13 +266,38 @@ def main():
     ap.add_argument("--lookback", type=int, default=20)
     ap.add_argument("--ma", type=int, default=20)
     ap.add_argument("--breakout", type=int, default=20)
+
+    # Nouveau: serveur HTTP optionnel
+    ap.add_argument("--serve", action="store_true", help="Expose /health et /status via HTTP (optionnel)")
+    ap.add_argument("--host", default=os.getenv("VIEWER_HOST", "127.0.0.1"))
+    ap.add_argument("--port", default=os.getenv("VIEWER_PORT", ""), help="'auto' (défaut si --serve), entier, ou vide=pas de serveur")
+    ap.add_argument("--base_port", type=int, default=int(os.getenv("VIEWER_BASE_PORT", "8765")))
+
     args = ap.parse_args()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     task = loop.create_task(stream(args.symbol, args.timeframe, args.limit, args.ma, args.breakout, args.overlay_ma20, args.overlay_hh20, args.lookback))
+    srv_ref = None
+
+    # Démarrage optionnel du serveur
+    want_serve = args.serve or os.getenv("VIEWER_SERVE", "0").lower() in ("1", "true", "yes", "on")
+    if want_serve:
+        if (not args.port) or (str(args.port).lower() in ("auto", "0")):
+            chosen = find_free_port_incremental(base=args.base_port, host=args.host)
+        else:
+            chosen = int(args.port)
+            
+        srv_ref, _ = start_status_server(args.host, chosen)
+        print(f"[serve] HTTP status on http://{args.host}:{chosen}  (GET /health, /status)")
 
     def handle_sig(*_):
+        if srv_ref:
+              try:
+                  srv_ref.shutdown()
+                  srv_ref.server_close()
+              except Exception:
+                  pass
         if not task.done():
             task.cancel()
     for s in (signal.SIGINT, signal.SIGTERM):
@@ -201,7 +308,21 @@ def main():
 
     try:
         loop.run_until_complete(task)
+    except KeyboardInterrupt:
+        # Redondant mais inoffensif si SIGINT déjà capté
+        if srv_ref:
+            try:
+                srv_ref.shutdown()
+                srv_ref.server_close()
+            except Exception:
+                pass
     finally:
+        if srv_ref:
+            try:
+                srv_ref.shutdown()
+                srv_ref.server_close()
+            except Exception:
+                pass
         loop.stop()
         loop.close()
 

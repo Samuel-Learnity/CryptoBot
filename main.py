@@ -12,6 +12,7 @@ import time
 import math
 import json
 import csv
+import signal
 import shutil
 import sys
 import datetime as dt
@@ -27,6 +28,12 @@ import yaml
 from rich.console import Console
 from rich.table import Table
 from rich import box
+
+# === AJOUTS: logging & asyncio helpers ===
+import logging
+import asyncio
+import inspect
+from concurrent.futures import TimeoutError as FuturesTimeout
 
 # WS (optionnel, gratuit via API Binance)
 try:
@@ -44,6 +51,21 @@ def now_utc() -> dt.datetime:
 
 def today_utc_date() -> dt.date:
     return now_utc().date()
+
+
+def _setup_file_logger(name: str = "bot", log_dir: str = "logs") -> logging.Logger:
+    """Crée un logger fichier avec timestamps."""
+    os.makedirs(log_dir, exist_ok=True)
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fname = os.path.join(log_dir, f"bot-events-{now_utc().strftime('%Y%m%d')}.log")
+    fh = logging.FileHandler(fname, encoding="utf-8")
+    fmt = logging.Formatter(fmt="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
 
 
 @dataclass
@@ -69,6 +91,7 @@ class Config:
     use_websocket: bool = True
     ws_reconnect_sec: float = 3.0
     sound_alerts: bool = True
+    dashboard_clear: bool = True   # AJOUT: permet de ne pas effacer le terminal si False
 
     @staticmethod
     def from_yaml(path: str) -> "Config":
@@ -129,12 +152,17 @@ class StopLossBot:
         self.journal_path = cfg.journal_csv
         self._init_journal()
 
+        # Logger fichiers
+        self.log = _setup_file_logger()
+
         # WS helpers
         self._ws = None
         self._last_ticker: Dict[str, float] = {}
         self._last_closed_ts: Dict[str, int] = {}
 
         console.print(f"[cyan]Exchange:[/cyan] {self.exchange.id} | [cyan]Dry run:[/cyan] {self.cfg.dry_run}")
+        self.log.info("BOOT exchange=%s dry_run=%s symbols=%s timeframe=%s",
+                      self.exchange.id, self.cfg.dry_run, self.cfg.symbols, self.cfg.timeframe)
 
         # WebSocket: démarrage si activé et exchange=binance
         if self.cfg.use_websocket and self.exchange.id == "binance" and BinanceWS and StreamConfig:
@@ -156,7 +184,6 @@ class StopLossBot:
                 reconnect_delay=self.cfg.ws_reconnect_sec,
             )
             try:
-                import asyncio
                 try:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
@@ -165,8 +192,10 @@ class StopLossBot:
                 self._ws = BinanceWS(sc)
                 self._ws.start(loop)
                 console.print("[green]WebSocket Binance démarré (gratuit, market data).[/green]")
+                self.log.info("WS started (binance)")
             except Exception as e:
                 console.print(f"[yellow]WebSocket non démarré: {e}. Fallback polling.[/yellow]")
+                self.log.warning("WS not started: %s", e)
 
     def _compute_levels_from_df(self, df: pd.DataFrame) -> dict:
         """Calcule HH/LL sur la base du DF passé (pas d'appel réseau ici)."""
@@ -181,7 +210,7 @@ class StopLossBot:
     def _cache_levels(self, symbol: str, df: pd.DataFrame) -> None:
         lv = self._compute_levels_from_df(df)
         if lv:
-          self._levels[symbol] = lv
+            self._levels[symbol] = lv
 
     # ---------------- Sound Alerts ----------------
     def _ding(self, kind: str = "info"):
@@ -237,6 +266,7 @@ class StopLossBot:
         return exchange
 
     def _init_journal(self):
+        os.makedirs(os.path.dirname(self.journal_path) or ".", exist_ok=True)
         if not os.path.exists(self.journal_path):
             with open(self.journal_path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
@@ -246,6 +276,9 @@ class StopLossBot:
         with open(self.journal_path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([now_utc().isoformat(), symbol, action, f"{price:.8f}", f"{qty:.8f}", f"{pnl:.2f}", f"{self.equity:.2f}", note])
+        # AJOUT: log lisible avec timestamp
+        self.log.info("TRADE action=%s symbol=%s price=%.4f qty=%.8f pnl=%.2f equity=%.2f note=%s",
+                      action, symbol, price, qty, pnl, self.equity, note)
 
     # ---------------- Market helpers ----------------
     def _fetch_ohlcv_df(self, symbol: str, limit: int = 200) -> pd.DataFrame:
@@ -319,11 +352,13 @@ class StopLossBot:
         spread_pct = self._orderbook_spread_pct(symbol)
         if spread_pct > self.cfg.max_spread_pct:
             console.print(f"[yellow]Spread {spread_pct:.2f}% > max {self.cfg.max_spread_pct:.2f}% : pas d'entrée.[/yellow]")
+            self.log.info("ENTRY_BLOCKED spread=%.3f%% max=%.3f%% symbol=%s", spread_pct, self.cfg.max_spread_pct, symbol)
             return None
         qty = self._position_size(entry, stop)
         qty = self._round_amount(symbol, qty)
         if qty <= 0:
             console.print("[red]Taille calculée nulle. Vérifie le capital, le risque ou le stop.[/red]")
+            self.log.warning("SIZE_ZERO symbol=%s entry=%.4f stop=%.4f", symbol, entry, stop)
             return None
         m = self._get_market_info(symbol)
         min_cost = m["min_cost"]
@@ -331,6 +366,7 @@ class StopLossBot:
             notional = qty * entry
             if notional < min_cost:
                 console.print(f"[yellow]Notional {notional:.2f} < min_cost {min_cost:.2f}. Ajuste le risque ou choisis un autre symbole.[/yellow]")
+                self.log.info("ENTRY_BLOCKED min_cost notional=%.2f min_cost=%.2f", notional, min_cost)
                 return None
         pos = Position(symbol=symbol, entry_price=entry, qty=qty, stop_price=stop, r_value=entry - stop, tp1_price=tp1, tp_fraction=self.cfg.tp_fraction, remaining_qty=qty)
         if self.cfg.dry_run:
@@ -350,6 +386,7 @@ class StopLossBot:
             return pos
         except Exception as e:
             console.print(f"[red]Erreur d'exécution live: {e}[/red]")
+            self.log.error("ENTER_ERROR %s", e)
             return None
 
     def _exit_market(self, reason: str, price: float):
@@ -388,6 +425,7 @@ class StopLossBot:
             self.position = None
         except Exception as e:
             console.print(f"[red]Erreur de sortie live: {e}[/red]")
+            self.log.error("EXIT_ERROR %s", e)
 
     def _partial_take_profit(self, price: float):
         if not self.position:
@@ -419,6 +457,7 @@ class StopLossBot:
             console.print(f"[magenta]LIVE:[/magenta] TP partiel qty={qty_tp} @ {fill_price:.2f} | Stop => {pos.stop_price:.2f}")
         except Exception as e:
             console.print(f"[red]Erreur TP1 live: {e}[/red]")
+            self.log.error("TP1_ERROR %s", e)
 
     # ---------------- Risk throttles ----------------
     def _reset_daily_if_needed(self):
@@ -438,11 +477,12 @@ class StopLossBot:
         console.rule("[bold green]Stop-Loss Bot — Démarrage")
         last_checked_candle = {s: None for s in self.cfg.symbols}
         try:
-            while True:
+            while True:  # loop; SIGTERM/KeyboardInterrupt will break
                 self._reset_daily_if_needed()
                 if self._kill_switch_tripped():
                     self._ding("kill")
                     console.print(f"[red]Kill switch: PnL journalier {self._daily_pnl_pct():.2f}% <= {self.cfg.kill_switch_daily_dd_pct:.2f}% — pause jusqu'au lendemain.[/red]")
+                    self.log.warning("KILL_SWITCH daily_pnl=%.2f%% threshold=%.2f%%", self._daily_pnl_pct(), self.cfg.kill_switch_daily_dd_pct)
                     time.sleep(self.cfg.poll_seconds)
                     continue
 
@@ -477,9 +517,20 @@ class StopLossBot:
                                     break
 
                 self._render_status()
+                # Log périodique d'état (lisible) :
+                try:
+                    sym0 = self.cfg.symbols[0]
+                    self.log.info("STATUS ex=%s dry=%s eq=%.2f daily=%.2f%% pos=%s",
+                                  self.exchange.id, self.cfg.dry_run, self.equity, self._daily_pnl_pct(),
+                                  (self.position.symbol if self.position else "None"))
+                except Exception:
+                    pass
+
                 time.sleep(self.cfg.poll_seconds)
         except KeyboardInterrupt:
             console.print("[yellow]Arrêt demandé par l'utilisateur.[/yellow]")
+            self.log.info("USER_INTERRUPT")
+
     def _current_hh_level(self, symbol: str) -> float:
         L = self.cfg.breakout_lookback
         df = self._fetch_ohlcv_df(symbol, limit=L + 2)
@@ -489,7 +540,6 @@ class StopLossBot:
         L = self.cfg.stop_lookback
         df = self._fetch_ohlcv_df(symbol, limit=L + 2)
         return float(df["low"].iloc[-(L + 1):-1].min())
-
 
     # ---------------- Status UI ----------------
     def _render_status(self):
@@ -513,7 +563,6 @@ class StopLossBot:
             table.add_row(f"Prix ({sym0})", f"{(last or 0):.4f}")
             table.add_row("Spread", f"{spread_pct:.3f}%")
             try:
-                sym0 = self.cfg.symbols[0]
                 lv = getattr(self, "_levels", {}).get(sym0)
                 if lv:
                     table.add_row(f"HH{self.cfg.breakout_lookback} ({sym0})",
@@ -523,7 +572,6 @@ class StopLossBot:
                 else:
                     table.add_row("HH/LL", "n/c — en attente d’un premier calcul")
             except Exception:
-                # ne laissons pas l'UI casser si le cache est vide
                 pass
         except Exception:
             pass
@@ -539,14 +587,74 @@ class StopLossBot:
         else:
             table.add_row("Position", "Aucune")
 
-        console.clear()
+        # Ne pas écraser le terminal si dashboard_clear=False
+        if self.cfg.dashboard_clear:
+            console.clear()
         console.print(table)
+
+    def close(self):
+        """Nettoyage doux: arrêter le WS, flush, etc."""
+        try:
+            ws = getattr(self, "_ws", None)
+            if ws:
+                stop = getattr(ws, "stop", None)
+                if stop:
+                    try:
+                        res = stop()
+                        if inspect.isawaitable(res):
+                            # Si le WS expose sa loop, tente d'arrêter dessus
+                            loop = getattr(ws, "loop", None)
+                            if loop and loop.is_running():
+                                fut = asyncio.run_coroutine_threadsafe(res, loop)
+                                try:
+                                    fut.result(timeout=2.0)
+                                except FuturesTimeout:
+                                    pass
+                            else:
+                                try:
+                                    asyncio.run(res)
+                                except RuntimeError:
+                                    # Si une loop est déjà active dans ce thread
+                                    new_loop = asyncio.new_event_loop()
+                                    new_loop.run_until_complete(res)
+                                    new_loop.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            # CCXT ne nécessite pas de close explicite
+            _ = getattr(self, "exchange", None)
+        except Exception:
+            pass
 
 
 def main():
     cfg = Config.from_yaml("config.yaml")
     bot = StopLossBot(cfg)
-    bot.run()
+
+    pid = os.getpid()
+    print(f"[BOOT] PID={pid}")
+
+    def _graceful_exit(signum, frame):
+        # Laisser remonter SystemExit pour casser les boucles de run()
+        raise SystemExit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _graceful_exit)
+        except Exception:
+            pass
+
+    try:
+        bot.run()
+    except SystemExit:
+        pass
+    finally:
+        try:
+            bot.close()
+        finally:
+            print(f"[SHUTDOWN] PID={pid}")
 
 
 if __name__ == "__main__":
